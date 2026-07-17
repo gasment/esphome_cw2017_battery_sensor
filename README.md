@@ -41,6 +41,7 @@
     id: cw2017_main
     address: 0x63
     write_profile: true  #写入4.2v默认配置
+    delay_init_on_boot: 5s  #开机时的初始化延迟时间
     update_interval: 60s  #更新频率
   
     voltage:  #电池电压

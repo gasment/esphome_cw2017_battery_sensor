@@ -20,6 +20,7 @@ CW2017Component = cw2017_ns.class_(
     "CW2017Component", cg.PollingComponent, i2c.I2CDevice
 )
 
+CONF_DELAY_INIT_ON_BOOT = "delay_init_on_boot"
 CONF_BATTERY_PROFILE = "battery_profile"
 CONF_WRITE_PROFILE = "write_profile"
 CONF_VOLTAGE = "voltage"
@@ -45,6 +46,7 @@ CONFIG_SCHEMA = (
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(CW2017Component),
+            cv.Optional(CONF_DELAY_INIT_ON_BOOT, default="0ms"): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_BATTERY_PROFILE): BATTERY_PROFILE_SCHEMA,
             cv.Optional(CONF_WRITE_PROFILE, default=True): cv.boolean,
             cv.Optional(CONF_VOLTAGE): sensor.sensor_schema(
@@ -76,6 +78,10 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await i2c.register_i2c_device(var, config)
+
+    # 延迟初始化配置（毫秒）
+    delay_ms = config[CONF_DELAY_INIT_ON_BOOT]
+    cg.add(var.set_delay_init_ms(delay_ms))
 
     if CONF_BATTERY_PROFILE in config:
         profile = config[CONF_BATTERY_PROFILE]
