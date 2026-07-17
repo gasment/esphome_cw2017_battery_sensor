@@ -13,6 +13,21 @@ static const char *const TAG = "cw2017";
 // ============================================================================
 
 void CW2017Component::setup() {
+  if (this->delay_init_ms_ > 0) {
+    ESP_LOGI(TAG, "setup(): delay_init_on_boot=%ums, deferring I2C init", this->delay_init_ms_);
+    // 立即返回，不阻塞其他组件启动
+    // 通过set_timeout在指定延迟后执行真正的初始化
+    this->set_timeout(this->delay_init_ms_, [this]() {
+      this->perform_real_setup_();
+    });
+    return;
+  }
+
+  // 默认（delay=0ms）：立即执行初始化
+  this->perform_real_setup_();
+}
+
+void CW2017Component::perform_real_setup_() {
   ESP_LOGCONFIG(TAG, "Setting up CW2017...");
 
   // 1. 强制复位设备（写 0xF0 到 CONFIG 完全复位所有寄存器）
@@ -67,6 +82,42 @@ void CW2017Component::setup() {
 
   this->initialized_ = true;
   ESP_LOGI(TAG, "CW2017 initialized successfully, version: 0x%02X", version);
+
+  // 初始化后SOC可能仍是0xFF（算法需要额外时间计算）
+  // 不阻塞等待，安排延迟重试直到SOC就绪
+  if (this->soc_sensor_ != nullptr) {
+    this->schedule_soc_retry_(0);
+  }
+}
+
+void CW2017Component::schedule_soc_retry_(int retry_count) {
+  if (!this->initialized_ || this->soc_sensor_ == nullptr) {
+    return;
+  }
+
+  // 最多重试8次（每次间隔约1秒，总等待约8秒）
+  if (retry_count >= 8) {
+    ESP_LOGW(TAG, "SOC still 0xFF after %d retries, giving up", retry_count);
+    return;
+  }
+
+  // 尝试读取SOC
+  float soc;
+  if (this->read_soc(&soc)) {
+    // SOC就绪，发布
+    this->soc_sensor_->publish_state(soc);
+    ESP_LOGI(TAG, "Deferred SOC read success: %.2f%% (after %d retries)", soc, retry_count);
+    return;
+  }
+
+  // SOC还没好，写0x0A kick一下触发算法，1秒后重试
+  ESP_LOGD(TAG, "SOC not ready yet (0xFF), scheduling retry %d in 1s...", retry_count + 1);
+  this->write_register(CW2017_REG_INT_CONF, CW2017_MODE_SLEEP);
+  delay(2);
+  this->write_register(CW2017_REG_INT_CONF, 0x40);  // 恢复0x40(中断使能)，不改变工作模式
+  this->set_timeout(1000, [this, retry_count]() {
+    this->schedule_soc_retry_(retry_count + 1);
+  });
 }
 
 void CW2017Component::update() {
@@ -118,6 +169,9 @@ void CW2017Component::dump_config() {
   ESP_LOGCONFIG(TAG, "CW2017 Fuel Gauge:");
   LOG_I2C_DEVICE(this);
   ESP_LOGCONFIG(TAG, "  Write Profile: %s", YESNO(this->write_profile_));
+  if (this->delay_init_ms_ > 0) {
+    ESP_LOGCONFIG(TAG, "  Delay Init On Boot: %ums", this->delay_init_ms_);
+  }
   if (!this->battery_profile_.empty()) {
     ESP_LOGCONFIG(TAG, "  Custom Battery Profile: %u bytes", this->battery_profile_.size());
   } else {
