@@ -130,6 +130,11 @@ class CW2017Component : public PollingComponent, public i2c::I2CDevice {
 
   /// ========== 配置接口 ==========
 
+  /// 设置延迟初始化毫秒数（冷启动/deep sleep唤醒时延迟初始化，加快其他组件启动速度）
+  void set_delay_init_ms(uint32_t delay_ms) {
+    this->delay_init_ms_ = delay_ms;
+  }
+
   void set_battery_profile(const std::vector<uint8_t> &profile) {
     this->battery_profile_ = profile;
   }
@@ -171,6 +176,7 @@ class CW2017Component : public PollingComponent, public i2c::I2CDevice {
   /// ========== 配置参数 ==========
   std::vector<uint8_t> battery_profile_;
   bool write_profile_{true};
+  uint32_t delay_init_ms_{0};  ///< 冷启动/deep sleep唤醒时延迟初始化的毫秒数
 
   /// ========== 状态变量 ==========
   bool initialized_{false};
@@ -181,6 +187,14 @@ class CW2017Component : public PollingComponent, public i2c::I2CDevice {
   bool read_register(uint8_t reg, uint8_t *data);
   bool write_register(uint8_t reg, uint8_t data);
   bool read_registers(uint8_t start_reg, uint8_t *data, size_t len);
+
+  /// ========== 延迟初始化 ==========
+  /** 延迟初始化的真实执行方法（被setup或set_timeout调用） */
+  void perform_real_setup_();
+
+  /// ========== SOC延迟就绪重试 ==========
+  /** 初始化后SOC可能为0xFF（算法需额外时间），定时重试直到就绪 */
+  void schedule_soc_retry_(int retry_count);
 
   /// ========== 芯片操作 ==========
 
