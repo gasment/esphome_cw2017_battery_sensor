@@ -1,5 +1,7 @@
 #include "cw2017.h"
 
+#include <cinttypes>
+
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 
@@ -14,7 +16,7 @@ static const char *const TAG = "cw2017";
 
 void CW2017Component::setup() {
   if (this->delay_init_ms_ > 0) {
-    ESP_LOGI(TAG, "setup(): delay_init_on_boot=%ums, deferring I2C init", this->delay_init_ms_);
+    ESP_LOGI(TAG, "setup(): delay_init_on_boot=%" PRIu32 "ms, deferring I2C init", this->delay_init_ms_);
     // 立即返回，不阻塞其他组件启动
     // 通过set_timeout在指定延迟后执行真正的初始化
     this->set_timeout(this->delay_init_ms_, [this]() {
@@ -46,11 +48,11 @@ void CW2017Component::perform_real_setup_() {
     if (!this->battery_profile_.empty() && this->battery_profile_.size() == CW2017_PROFILE_SIZE) {
       profile = this->battery_profile_.data();
       profile_size = this->battery_profile_.size();
-      ESP_LOGI(TAG, "Using user-provided battery profile (size=%u)", profile_size);
+      ESP_LOGI(TAG, "Using user-provided battery profile (size=%zu)", profile_size);
     } else {
       profile = CW2017_DEFAULT_PROFILE_4_2V;
       profile_size = sizeof(CW2017_DEFAULT_PROFILE_4_2V);
-      ESP_LOGI(TAG, "No battery_profile provided, using built-in 4.2V default profile (size=%u)", profile_size);
+      ESP_LOGI(TAG, "No battery_profile provided, using built-in 4.2V default profile (size=%zu)", profile_size);
     }
 
     if (!this->write_battery_profile_data(profile, profile_size)) {
@@ -170,10 +172,10 @@ void CW2017Component::dump_config() {
   LOG_I2C_DEVICE(this);
   ESP_LOGCONFIG(TAG, "  Write Profile: %s", YESNO(this->write_profile_));
   if (this->delay_init_ms_ > 0) {
-    ESP_LOGCONFIG(TAG, "  Delay Init On Boot: %ums", this->delay_init_ms_);
+    ESP_LOGCONFIG(TAG, "  Delay Init On Boot: %" PRIu32 "ms", this->delay_init_ms_);
   }
   if (!this->battery_profile_.empty()) {
-    ESP_LOGCONFIG(TAG, "  Custom Battery Profile: %u bytes", this->battery_profile_.size());
+    ESP_LOGCONFIG(TAG, "  Custom Battery Profile: %zu bytes", this->battery_profile_.size());
   } else {
     ESP_LOGCONFIG(TAG, "  Battery Profile: Default 4.2V");
   }
@@ -320,14 +322,14 @@ bool CW2017Component::write_battery_profile_data(const uint8_t *profile, size_t 
     return false;
   }
 
-  ESP_LOGI(TAG, "Writing battery profile to registers 0x%02X-0x%02X (size=%u)",
-           CW2017_REG_BATINFO, CW2017_REG_BATINFO + len - 1, len);
+  ESP_LOGI(TAG, "Writing battery profile to registers 0x%02X-0x%02X (size=%zu)",
+           CW2017_REG_BATINFO, static_cast<unsigned int>(CW2017_REG_BATINFO + len - 1), len);
 
   // 逐字节写入电池配置信息（寄存器 0x10 ~ 0x5F）
   for (size_t i = 0; i < len; i++) {
     if (!this->write_register(CW2017_REG_BATINFO + i, profile[i])) {
-      ESP_LOGE(TAG, "Failed to write profile byte %u at register 0x%02X",
-               i, CW2017_REG_BATINFO + i);
+      ESP_LOGE(TAG, "Failed to write profile byte %zu at register 0x%02X",
+               i, static_cast<unsigned int>(CW2017_REG_BATINFO + i));
       return false;
     }
     delay(2);  // 每个寄存器写入间隔2ms，确保设备处理

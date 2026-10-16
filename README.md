@@ -18,11 +18,11 @@
 | 温度阈值 | ❌ | 温度保护 |
 
 ## 配置说明
-* esphome版本>=2026.7.0时，需要使用platformio工具链编译，暂未兼容esp-idf编译
+* esphome版本更新到2026.7.0以上，并使用默认esp-idf toolchain编译
   ```
   esp32:
   variant: esp32xxx #芯片型号
-  toolchain: platformio
+  toolchain: esp-idf
   framework:
     type: esp-idf
 
