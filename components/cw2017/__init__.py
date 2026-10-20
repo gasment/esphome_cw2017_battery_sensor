@@ -1,3 +1,5 @@
+import hashlib
+import json
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import i2c, sensor
@@ -74,10 +76,18 @@ CONFIG_SCHEMA = (
 )
 
 
+def rtc_identity(config):
+    # Configuration identity only: runtime state never consumes the shared RTC preferences pool.
+    identity = [1, str(config[CONF_ID]), str(config.get("i2c_id", "")), config["address"],
+                config[CONF_WRITE_PROFILE], [int(v) for v in config.get(CONF_BATTERY_PROFILE, [])]]
+    return int(hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:8], 16)
+
+
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await i2c.register_i2c_device(var, config)
+    cg.add(var.set_rtc_identity(rtc_identity(config)))
 
     # 延迟初始化配置（毫秒）
     delay_ms = config[CONF_DELAY_INIT_ON_BOOT]

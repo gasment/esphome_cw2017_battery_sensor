@@ -1,6 +1,12 @@
 #include "cw2017.h"
 
 #include <cinttypes>
+#include <cstddef>
+#include <cstring>
+#ifdef USE_ESP32
+#include "esp_attr.h"
+#include "esp_system.h"
+#endif
 
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
@@ -10,11 +16,122 @@ namespace cw2017 {
 
 static const char *const TAG = "cw2017";
 
+#ifdef USE_ESP32
+namespace {
+// A dedicated RTC record: do not allocate from the reporter/display preferences pool.
+struct RetainedPowerState {
+  uint32_t magic, identity, sleeping, chip_version, checksum;
+};
+static constexpr uint32_t RTC_MAGIC = 0x43573231U;
+static RTC_DATA_ATTR RetainedPowerState retained_power{};
+uint32_t power_checksum(const RetainedPowerState &state) {
+  uint32_t hash = 2166136261U;
+  const auto *bytes = reinterpret_cast<const uint8_t *>(&state);
+  for (size_t i = 0; i < offsetof(RetainedPowerState, checksum); ++i) hash = (hash ^ bytes[i]) * 16777619U;
+  return hash;
+}
+}  // namespace
+#endif
+
+void CW2017Component::invalidate_rtc_state_() {
+#ifdef USE_ESP32
+  retained_power.magic = 0;
+#endif
+}
+
+void CW2017Component::save_rtc_state_() {
+#ifdef USE_ESP32
+  if (!this->initialized_) { this->invalidate_rtc_state_(); return; }
+  RetainedPowerState next{RTC_MAGIC, this->rtc_identity_, this->sleeping_ ? 1U : 0U, this->chip_version_, 0};
+  next.checksum = power_checksum(next);
+  retained_power = next;
+#endif
+}
+
+bool CW2017Component::try_resume_from_rtc_() {
+#ifdef USE_ESP32
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP || retained_power.magic != RTC_MAGIC ||
+      retained_power.identity != this->rtc_identity_ || retained_power.sleeping > 1 ||
+      retained_power.chip_version == 0 || retained_power.chip_version >= 0xFF ||
+      retained_power.checksum != power_checksum(retained_power)) return false;
+  const auto saved = retained_power;
+  // A failed/partial wake must never leave a reusable success marker behind.
+  this->invalidate_rtc_state_();
+  uint8_t config, version;
+  if (!this->read_register(CW2017_REG_CONFIG, &config)) {
+    ESP_LOGW(TAG, "RTC resume: cannot read CONFIG before wake; falling back to full initialization");
+    return false;
+  }
+  const uint8_t expected_config = saved.sleeping ? 0xF0 : 0x00;
+  if (config != expected_config) {
+    ESP_LOGW(TAG, "RTC resume: CONFIG mismatch (RTC expects 0x%02X, read 0x%02X); full initialization",
+             expected_config, config);
+    return false;
+  }
+  if (saved.sleeping && !this->wake_device()) {
+    ESP_LOGW(TAG, "RTC resume: wake failed; falling back to full initialization");
+    return false;
+  }
+  if (!this->read_register(CW2017_REG_CONFIG, &config)) {
+    ESP_LOGW(TAG, "RTC resume: cannot read CONFIG after wake; falling back to full initialization");
+    return false;
+  }
+  if (config != 0x00) {
+    ESP_LOGW(TAG, "RTC resume: CONFIG is 0x%02X after wake, expected 0x00; full initialization", config);
+    return false;
+  }
+  if (!this->read_version(&version)) {
+    ESP_LOGW(TAG, "RTC resume: VERSION read failed; falling back to full initialization");
+    return false;
+  }
+  if (version == 0x00 || version == 0xFF) {
+    ESP_LOGW(TAG, "RTC resume: invalid VERSION 0x%02X; falling back to full initialization", version);
+    return false;
+  }
+  if (version != saved.chip_version) {
+    // Logs show 0xA0 during full initialization and 0x0F later. Do not assume the
+    // early reading is a reliable invariant: retain CONFIG and full profile validation.
+    if (!this->write_profile_) {
+      ESP_LOGW(TAG, "RTC resume: VERSION changed (RTC=0x%02X current=0x%02X), no managed profile to verify; full initialization",
+               unsigned(saved.chip_version), version);
+      return false;
+    }
+    ESP_LOGW(TAG, "RTC resume: VERSION differs (RTC=0x%02X current=0x%02X); checking retained battery profile",
+             unsigned(saved.chip_version), version);
+  }
+  if (this->write_profile_) {
+    // The MCU's RTC cannot prove that the external gauge kept power. Read-only validation
+    // detects an independently reset/lost profile without rewriting 80 bytes every wake.
+    const uint8_t *expected = this->battery_profile_.size() == CW2017_PROFILE_SIZE ?
+        this->battery_profile_.data() : CW2017_DEFAULT_PROFILE_4_2V;
+    uint8_t actual[CW2017_PROFILE_SIZE];
+    if (!this->read_registers(CW2017_REG_BATINFO, actual, sizeof(actual)) ||
+        std::memcmp(actual, expected, sizeof(actual)) != 0) {
+      ESP_LOGW(TAG, "RTC resume: battery profile missing/mismatched; falling back to full initialization");
+      return false;
+    }
+  }
+  this->chip_version_ = version;
+  this->initialized_ = true; this->sleeping_ = false; this->fast_resume_ = true;
+  this->save_rtc_state_();
+  if (this->sleep_switch_) this->sleep_switch_->publish_state(false);
+  ESP_LOGI(TAG, "RTC resume successful (previous sleep=%s); reset and profile write skipped", YESNO(saved.sleeping));
+  // Allow ADC/SOC readiness to progress asynchronously; do not add the cold-start delay.
+  if (this->soc_sensor_) this->set_timeout("soc_retry", 200, [this]() { this->schedule_soc_retry_(0); });
+  return true;
+#else
+  return false;
+#endif
+}
+
+
 // ============================================================================
 // ESPHome 生命周期实现
 // ============================================================================
 
 void CW2017Component::setup() {
+  if (this->try_resume_from_rtc_()) return;
+  this->invalidate_rtc_state_();
   if (this->delay_init_ms_ > 0) {
     ESP_LOGI(TAG, "setup(): delay_init_on_boot=%" PRIu32 "ms, deferring I2C init", this->delay_init_ms_);
     // 立即返回，不阻塞其他组件启动
@@ -30,7 +147,10 @@ void CW2017Component::setup() {
 }
 
 void CW2017Component::perform_real_setup_() {
-  ESP_LOGCONFIG(TAG, "Setting up CW2017...");
+  ESP_LOGCONFIG(TAG, "Setting up CW2017 (full initialization)...");
+  this->invalidate_rtc_state_();
+  this->initialized_ = false; this->sleeping_ = false; this->fast_resume_ = false;
+  this->cancel_timeout("soc_retry");
 
   // 1. 强制复位设备（写 0xF0 到 CONFIG 完全复位所有寄存器）
   if (!this->write_register(CW2017_REG_CONFIG, 0xF0)) {
@@ -68,7 +188,9 @@ void CW2017Component::perform_real_setup_() {
   // 3. 唤醒设备（清除睡眠、重启进入正常模式）
   // Datasheet: 先写 0x30 清除睡眠，再写 0x00 触发重启
   if (!this->wake_device()) {
-    ESP_LOGW(TAG, "Wake device failed, continuing anyway");
+    ESP_LOGE(TAG, "Wake device failed");
+    this->mark_failed();
+    return;
   }
 
   // 等待 ADC 开始更新（datasheet: ADC 在 POR 后 <10ms 首次更新，之后每秒4次）
@@ -82,7 +204,10 @@ void CW2017Component::perform_real_setup_() {
     return;
   }
 
+  this->chip_version_ = version;
   this->initialized_ = true;
+  this->save_rtc_state_();
+  if (this->sleep_switch_) this->sleep_switch_->publish_state(false);
   ESP_LOGI(TAG, "CW2017 initialized successfully, version: 0x%02X", version);
 
   // 初始化后SOC可能仍是0xFF（算法需要额外时间计算）
@@ -93,36 +218,38 @@ void CW2017Component::perform_real_setup_() {
 }
 
 void CW2017Component::schedule_soc_retry_(int retry_count) {
-  if (!this->initialized_ || this->soc_sensor_ == nullptr) {
+  if (!this->initialized_ || this->sleeping_ || !this->soc_sensor_) return;
+  const int limit = this->fast_resume_ ? 40 : 8;
+  if (retry_count >= limit) {
+    ESP_LOGW(TAG, "SOC still unavailable after %d retries, giving up", retry_count);
     return;
   }
-
-  // 最多重试8次（每次间隔约1秒，总等待约8秒）
-  if (retry_count >= 8) {
-    ESP_LOGW(TAG, "SOC still 0xFF after %d retries, giving up", retry_count);
-    return;
-  }
-
-  // 尝试读取SOC
   float soc;
   if (this->read_soc(&soc)) {
-    // SOC就绪，发布
     this->soc_sensor_->publish_state(soc);
     ESP_LOGI(TAG, "Deferred SOC read success: %.2f%% (after %d retries)", soc, retry_count);
+    // Recover voltage if an earlier acquisition occurred before the ADC became ready.
+    if (this->voltage_sensor_ && !this->voltage_sensor_->has_state()) {
+      float voltage;
+      if (this->read_voltage(&voltage)) this->voltage_sensor_->publish_state(voltage);
+    }
     return;
   }
-
-  // SOC还没好，写0x0A kick一下触发算法，1秒后重试
-  ESP_LOGD(TAG, "SOC not ready yet (0xFF), scheduling retry %d in 1s...", retry_count + 1);
-  this->write_register(CW2017_REG_INT_CONF, CW2017_MODE_SLEEP);
-  delay(2);
-  this->write_register(CW2017_REG_INT_CONF, 0x40);  // 恢复0x40(中断使能)，不改变工作模式
-  this->set_timeout(1000, [this, retry_count]() {
+  const uint32_t interval = this->fast_resume_ ? 200 : 1000;
+  ESP_LOGD(TAG, "SOC not ready; scheduling retry %d in %ums", retry_count + 1, unsigned(interval));
+  // Retained configuration resumes by read-only polling, without sleep/mode kicks.
+  if (!this->fast_resume_) {
+    this->write_register(CW2017_REG_INT_CONF, CW2017_MODE_SLEEP);
+    delay(2);
+    this->write_register(CW2017_REG_INT_CONF, 0x40);
+  }
+  this->set_timeout("soc_retry", interval, [this, retry_count]() {
     this->schedule_soc_retry_(retry_count + 1);
   });
 }
 
 void CW2017Component::update() {
+  if (this->sleeping_) { ESP_LOGD(TAG, "Sleeping; skipping sensor acquisition"); return; }
   if (!this->initialized_) {
     ESP_LOGW(TAG, "Not initialized, skipping update");
     return;
@@ -171,6 +298,7 @@ void CW2017Component::dump_config() {
   ESP_LOGCONFIG(TAG, "CW2017 Fuel Gauge:");
   LOG_I2C_DEVICE(this);
   ESP_LOGCONFIG(TAG, "  Write Profile: %s", YESNO(this->write_profile_));
+  ESP_LOGCONFIG(TAG, "  RTC fast resume: %s; chip sleeping: %s", YESNO(this->fast_resume_), YESNO(this->sleeping_));
   if (this->delay_init_ms_ > 0) {
     ESP_LOGCONFIG(TAG, "  Delay Init On Boot: %" PRIu32 "ms", this->delay_init_ms_);
   }
@@ -203,45 +331,41 @@ float CW2017Component::get_setup_priority() const {
 // ============================================================================
 
 void CW2017Component::sleep() {
-  if (!this->initialized_) {
-    ESP_LOGW(TAG, "Not initialized, cannot sleep");
-    return;
-  }
-
+  if (!this->initialized_) { ESP_LOGW(TAG, "Not initialized, cannot sleep"); return; }
+  this->cancel_timeout("soc_retry");
+  this->invalidate_rtc_state_();
   ESP_LOGI(TAG, "Entering sleep mode...");
-
-  // Datasheet: 写 0xF0 到 CONFIG 使设备进入睡眠模式
-  // 默认值 0xF0 中 SLEEP[1:0]=11, RESTART[3:0]=0000
-  // 0xF0 = 0b11110000 → SLEEP=11(睡眠), RESTART=0000
-  if (!this->write_register(CW2017_REG_CONFIG, 0xF0)) {
-    ESP_LOGE(TAG, "Failed to enter sleep mode");
+  uint8_t config;
+  if (!this->write_register(CW2017_REG_CONFIG, 0xF0) ||
+      !this->read_register(CW2017_REG_CONFIG, &config) || config != 0xF0) {
+    ESP_LOGE(TAG, "Failed to confirm sleep mode; RTC resume marker invalidated");
     return;
   }
-
-  ESP_LOGI(TAG, "CW2017 entered sleep mode");
+  this->sleeping_ = true;
+  this->save_rtc_state_();
+  if (this->sleep_switch_) this->sleep_switch_->publish_state(true);
+  ESP_LOGI(TAG, "CW2017 entered sleep mode; RTC marker saved");
 }
 
 void CW2017Component::wake() {
-  if (!this->initialized_) {
-    ESP_LOGW(TAG, "Not initialized, cannot wake");
+  if (!this->initialized_) { ESP_LOGW(TAG, "Not initialized, cannot wake"); return; }
+  if (!this->sleeping_) {
+    if (this->sleep_switch_) this->sleep_switch_->publish_state(false);
     return;
   }
-
+  this->cancel_timeout("soc_retry");
+  this->invalidate_rtc_state_();
   ESP_LOGI(TAG, "Waking device from sleep...");
-
-  // Datasheet Power State:
-  //   步骤1: 写 0x30 清除睡眠模式 (SLEEP=11→SLEEP=00, RESTART保持)
-  //   步骤2: 写 0x00 触发重启进入正常模式
-  if (!this->wake_device()) {
-    ESP_LOGE(TAG, "Failed to wake device");
+  uint8_t config;
+  if (!this->wake_device() || !this->read_register(CW2017_REG_CONFIG, &config) || config != 0x00) {
+    ESP_LOGE(TAG, "Failed to confirm wake; RTC resume marker invalidated");
     return;
   }
-
-  // 仅在唤醒时即刻触发ADC，不等待、不读取
-  // deep sleep场景: YAML中已配置 touch→指纹→5s延迟→trigger_update
-  // 5s后CW2017的ADC和SOC算法已充分稳定，单次读取即可成功
-  ESP_LOGI(TAG, "CW2017 wake sequence done, ADC starting (data available in ~1.5s)");
-  // 注意: 不调用update()，不阻塞ESP32启动流程
+  this->sleeping_ = false; this->fast_resume_ = true;
+  this->save_rtc_state_();
+  if (this->sleep_switch_) this->sleep_switch_->publish_state(false);
+  if (this->soc_sensor_) this->set_timeout("soc_retry", 200, [this]() { this->schedule_soc_retry_(0); });
+  ESP_LOGI(TAG, "CW2017 wake sequence done; waiting for ADC asynchronously");
 }
 
 void CW2017Component::trigger_read() {
@@ -475,7 +599,6 @@ void CW2017SleepSwitch::write_state(bool state) {
     this->parent_->wake();
   }
 
-  this->publish_state(state);
 }
 
 // ============================================================================

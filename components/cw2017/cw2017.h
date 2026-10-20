@@ -130,7 +130,7 @@ class CW2017Component : public PollingComponent, public i2c::I2CDevice {
 
   /// ========== 配置接口 ==========
 
-  /// 设置延迟初始化毫秒数（冷启动/deep sleep唤醒时延迟初始化，加快其他组件启动速度）
+  /// Delay full initialization only; a verified RTC resume bypasses this delay.
   void set_delay_init_ms(uint32_t delay_ms) {
     this->delay_init_ms_ = delay_ms;
   }
@@ -138,16 +138,20 @@ class CW2017Component : public PollingComponent, public i2c::I2CDevice {
   void set_battery_profile(const std::vector<uint8_t> &profile) {
     this->battery_profile_ = profile;
   }
+  void set_rtc_identity(uint32_t identity) { this->rtc_identity_ = identity; }
+  bool is_sleeping() const { return this->sleeping_; }
+  bool is_initialized() const { return this->initialized_; }
+
   void set_write_profile(bool write_profile) {
     this->write_profile_ = write_profile;
   }
 
   /// ========== 控制接口 (由 switch/button 调用) ==========
 
-  /** @brief 进入休眠模式 (写 0x7F 到 CONFIG) */
+  /** @brief Enter sleep (CONFIG=0xF0), verify, and retain the power state in RTC. */
   void sleep();
 
-  /** @brief 唤醒设备进入正常模式并自动读取传感器 */
+  /** @brief Wake without blocking for ADC/SOC; schedule asynchronous readiness checks. */
   void wake();
 
   /** @brief 手动触发一次传感器数据读取 */
@@ -180,6 +184,9 @@ class CW2017Component : public PollingComponent, public i2c::I2CDevice {
 
   /// ========== 状态变量 ==========
   bool initialized_{false};
+  bool sleeping_{false}, fast_resume_{false};
+  uint8_t chip_version_{0};
+  uint32_t rtc_identity_{0};
   uint16_t last_soc_{0};
 
   /// ========== 底层 I2C 操作 ==========
@@ -191,6 +198,9 @@ class CW2017Component : public PollingComponent, public i2c::I2CDevice {
   /// ========== 延迟初始化 ==========
   /** 延迟初始化的真实执行方法（被setup或set_timeout调用） */
   void perform_real_setup_();
+  bool try_resume_from_rtc_();
+  void save_rtc_state_();
+  void invalidate_rtc_state_();
 
   /// ========== SOC延迟就绪重试 ==========
   /** 初始化后SOC可能为0xFF（算法需额外时间），定时重试直到就绪 */

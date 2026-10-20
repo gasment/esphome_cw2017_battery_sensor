@@ -29,3 +29,4 @@ async def to_code(config):
     var = await switch.new_switch(config)
     hub = await cg.get_variable(config[CONF_CW2017_ID])
     cg.add(var.set_parent(hub))
+    cg.add(hub.set_sleep_switch(var))
